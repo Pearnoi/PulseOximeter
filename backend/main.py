@@ -3,7 +3,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from bleak import BleakClient
-from scipy.signal import butter, filtfilt, find_peaks, lfilter
+from scipy.signal import cheby2, butter, filtfilt, find_peaks, lfilter
 from collections import deque
 import uvicorn
 import time
@@ -28,6 +28,8 @@ data_buffer = deque(maxlen=500) # Holds last 5 seconds of raw IR data
 connected_websockets = set()
 
 # --- 2. Signal Processing Functions ---
+B_BP, A_BP = cheby2(N=4, rs=40, Wn=[0.5, 12], btype='bandpass', fs=100)
+
 def double_moving_average(data, window1=5, window2=5):
     """Applies a double moving average to smooth the signal."""
     if len(data) < window1:
@@ -52,140 +54,43 @@ def apply_bandpass(data, lowcut=0.5, highcut=4.0, fs=100):
     b, a = butter_bandpass(lowcut, highcut, fs)
     return filtfilt(b, a, data)
 
-# def compute_bpm(ir_f, ir_raw):
-#     # 1. FINGER PRESENCE CHECK
-#     if np.mean(ir_raw) < 10000: 
-#         return 0, np.array([]), ir_f
-
-#     # We need at least 2.5 seconds of data
-#     if len(ir_f) < 250:
-#         return 0, np.array([]), ir_f
-    
-#     # 2. AUTO-CORRELATION
-#     # Remove the DC offset (mean) so we only correlate the pulsatile wave
-#     signal = ir_f - np.mean(ir_f)
-    
-#     # Calculate auto-correlation
-#     corr = np.correlate(signal, signal, mode='full')
-#     corr = corr[len(corr)//2:] # Keep only the positive lags
-    
-#     # We only care about heart rates between 40 BPM and 200 BPM
-#     # At 100Hz, 40 BPM = 1.5 seconds = 150 samples
-#     # At 100Hz, 200 BPM = 0.3 seconds = 30 samples
-#     min_lag = 30
-#     max_lag = 150
-    
-#     if len(corr) < max_lag:
-#         return 0, np.array([]), ir_f
-        
-#     # Find the peak in the auto-correlation within the valid BPM range
-#     valid_corr = corr[min_lag:max_lag]
-    
-#     # Check if the signal is too weak/noisy
-#     if np.max(valid_corr) < np.max(corr) * 0.1:
-#          return 0, np.array([]), ir_f
-         
-#     peak_lag = np.argmax(valid_corr) + min_lag
-    
-#     # 3. CALCULATE BPM
-#     bpm = 60.0 * 100 / peak_lag
-    
-#     # 4. Find peaks for the visual graph (using the calculated lag)
-#     # We use the lag to set the distance between peaks
-#     peaks, _ = find_peaks(ir_f, distance=int(peak_lag * 0.8), prominence=0.1)
-    
-#     if bpm < 40 or bpm > 200:
-#         return 0, peaks, ir_f
-        
-#     return bpm, peaks, ir_f
-
 def process_ppg(raw_ir, fs=100):
     """
     raw_ir: numpy array of raw IR samples
     fs: sample rate (100 Hz)
     """
-    # 1. High-pass filter to remove baseline drift (matches Arduino HP_ALPHA=0.95)
-    # This removes the slow wave you see in your screenshot
-    b_hp, a_hp = [0.95, -0.95], [1, -0.95]
-    hp = lfilter(b_hp, a_hp, raw_ir)
+    if len(raw_ir) < 200: # Need 2 seconds
+        return 0, np.array([]), (raw_ir - np.mean(raw_ir))
 
-    # 2. Low-pass filter to smooth out electrical noise (matches Arduino LP_ALPHA=0.15)
-    # This removes the jagged edges on the wave
-    b_lp, a_lp = [0.15], [1, -0.85]
-    clean_wave = lfilter(b_lp, a_lp, hp)
-
-    # 3. Find peaks dynamically based on the wave's own amplitude
-    # Use the last 3 seconds (300 samples) to avoid edge effects
-    window = clean_wave[-300:]
-    amp_range = np.max(window) - np.min(window)
+    # A. Bandpass Filter (0.5 - 12 Hz)
+    # Use lfilter for real-time streaming (not filtfilt)
+    filtered_bp = lfilter(B_BP, A_BP, raw_ir)
     
-    # If the wave is completely flat (no finger), return 0
-    if amp_range < 0.05:
+    # B. 50ms Moving Average Filter (5 samples)
+    clean_wave = np.convolve(filtered_bp, np.ones(3)/3, mode='same')
+
+    # TODO C. Motion artifact correction with accelerometer 
+
+    peaks, properties = find_peaks(
+        clean_wave, 
+        distance=50,       # Minimum 0.5s between beats (120 BPM max)
+        prominence=0.1,    # Very sensitive, let the filter do the work
+        height=0           # Must be a positive peak
+    )
+
+    if len(peaks) < 3:
         return 0, np.array([]), clean_wave
 
-    # Prominence = 20% of the peak-to-peak amplitude
-    prominence = amp_range * 0.2
-    
-    peaks, _ = find_peaks(window, distance=50, prominence=prominence)
-    
-    # 4. Calculate BPM
-    if len(peaks) < 3:
-        bpm = 0
-    else:
-        # Use the last 4 peaks (3 intervals) for a stable reading
-        recent_peaks = peaks[-4:] 
-        intervals = np.diff(recent_peaks)
-        
-        # Use the median to ignore any single weird interval
-        median_interval = np.median(intervals)
-        bpm = 60.0 * fs / median_interval
-        
-        if bpm < 40 or bpm > 150:
-            bpm = 0
+    # D. Calculate BPM using median interval
+    intervals = np.diff(peaks)
+    bpm = 60.0 * fs / np.median(intervals)
+
+    if bpm < 40 or bpm > 200:
+        return 0, np.array([]), clean_wave
 
     return bpm, peaks, clean_wave
 
-# def compute_spo2(ir_raw, red_raw, ir_filtered, red_filtered):
-#     """
-#     Compute SpO2 using the standard Ratio-of-Ratios method.
-
-#     R = (AC_red / DC_red) / (AC_ir / DC_ir)
-
-#     AC = peak-to-peak amplitude of the pulsatile (filtered) signal
-#     DC = mean of the raw (unfiltered) signal
-#     """
-#     if len(ir_raw) < 100 or len(red_raw) < 100:
-#         return 0
-
-#     if np.mean(ir_raw) < 10000:
-#         return 0
-
-#     # AC components: peak-to-peak of the filtered (pulsatile) signal
-#     ac_ir  = np.max(ir_filtered)  - np.min(ir_filtered)
-#     ac_red = np.max(red_filtered) - np.min(red_filtered)
-
-#     # DC components: mean of the raw signal (baseline)
-#     dc_ir  = np.mean(ir_raw)
-#     dc_red = np.mean(red_raw)
-
-#     # Guard against division by zero
-#     if dc_ir <= 0 or dc_red <= 0 or ac_ir <= 0:
-#         return 0
-
-#     # Ratio of Ratios
-#     R = (ac_red / dc_red) / (ac_ir / dc_ir)
-
-#     # Empirical calibration curve (quadratic, fit to MAX30102 datasheet)
-#     a, b, c = 1.5958422, -34.6596622, 112.6898759
-#     spo2 = a * R * R + b * R + c
-
-#     print(f"AC_IR: {ac_ir:.2f} | DC_IR: {dc_ir:.2f} | AC_RED: {ac_red:.2f} | DC_RED: {dc_red:.2f} | R: {R:.2f}")
-
-#     # Clamp to physiologically plausible range
-#     spo2 = max(70.0, min(100.0, spo2))
-#     return spo2
-
-def compute_spo2(ir_raw, red_raw, ir_filtered, red_filtered):
+def compute_spo2(ir_raw, red_raw):
     """
     Matches the Arduino logic: DC = avg raw, AC = peak-to-peak of the last 2 seconds of raw
     """
@@ -276,22 +181,14 @@ async def processing_loop():
             ir_raw = np.array([x[0] for x in data_buffer])
             red_raw = np.array([x[1] for x in data_buffer])
 
-            # 1. Filter + MVA
-            # ir_f  = apply_bandpass(double_moving_average(ir_raw))
-            # red_f = apply_bandpass(double_moving_average(red_raw))
-            
             # 2. Calculate BPM 
             bpm, peaks, ir_f = process_ppg(ir_raw, fs=100)
-
-            b_hp, a_hp = [0.95, -0.95], [1, -0.95]
-            b_lp, a_lp = [0.15], [1, -0.85]
-            red_f = lfilter(b_lp, a_lp, lfilter(b_hp, a_hp, red_raw))
 
             # 3. Calculate SpO2
             if bpm == 0:
                 spo2 = 0
             else:
-                spo2 = compute_spo2(ir_raw, red_raw, ir_f, red_f)
+                spo2 = compute_spo2(ir_raw, red_raw)
 
             # centered_ir = ir_raw - np.mean(ir_raw)
 
