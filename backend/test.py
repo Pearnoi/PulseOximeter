@@ -7,6 +7,7 @@ from scipy.signal import cheby2, butter, filtfilt, find_peaks, lfilter, sosfiltf
 from collections import deque
 import uvicorn
 import time
+import struct
 
 app = FastAPI()
 
@@ -21,6 +22,7 @@ app.add_middleware(
 # --- 1. Global State & Configuration ---
 BLE_ADDRESS = "C5:91:ED:08:1D:7D"
 CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e" 
 
 is_monitoring = False
 ble_client = None
@@ -32,12 +34,15 @@ last_good_spo2 = 0
 last_good_time = 0.0
 BPM_HOLD_TIMEOUT = 3.0
 
+notification_count = 0
+sample_count = 0
+
 # --- 2. Signal Processing Functions ---
 # Two separate paths so we get BOTH fast numbers and a good-looking waveform:
 #   METRICS path (BPM / SpO2): causal lfilter, uses the newest sample -> "instant" readings
 #   DISPLAY path (waveform):   zero-phase filtfilt + light Savitzky-Golay -> keeps the
 #                              dicrotic notch / true pulse shape, at the cost of a small lag
-B_BP, A_BP = cheby2(N=4, rs=40, Wn=[0.5, 12], btype='bandpass', fs=100)
+B_BP, A_BP = cheby2(N=2, rs=40, Wn=[0.5, 12], btype='bandpass', fs=100)
 
 # Display-path filter: same 4th-order Cheby II 0.5-12 Hz design, but as SOS (numerically
 # safer) and run forward+backward (zero phase). 12 Hz keeps the dicrotic notch intact.
@@ -128,7 +133,7 @@ def process_display_wave(raw_ir, fs=100):
 
     # 3. Light Savitzky-Golay smoothing (instead of the 3-point moving average).
     #    Fits a small polynomial per window, so it cleans noise without flattening peaks.
-    x = savgol_filter(x, SG_WINDOW, SG_POLY)
+    # x = savgol_filter(x, SG_WINDOW, SG_POLY)
 
     # 4. Drop the unreliable newest edge, then take the display slice
     end = len(x) - DISPLAY_LAG
@@ -201,17 +206,48 @@ def signal_quality(ir_raw, ir_f):
 
 # --- 3. The BLE Background Task ---
 def ble_notification_handler(sender, data):
-    """Triggered 100 times a second by the XIAO."""
+    global notification_count, sample_count
     try:
-        decoded = data.decode('utf-8').strip()
-        parts = decoded.split(',')
-        if len(parts) == 2:
-            raw_ir = float(parts[0])
-            raw_red = float(parts[1])
-            # Add to our buffer
-            data_buffer.append((raw_ir, raw_red))
+        notification_count += 1
+
+        # We expect exactly 14 bytes
+        if len(data) != 14:
+            return
+
+        # Unpack the 14 bytes:
+        # < = Little Endian
+        # l = long (4 bytes) for IR
+        # l = long (4 bytes) for Red
+        # h = short (2 bytes) for X
+        # h = short (2 bytes) for Y
+        # h = short (2 bytes) for Z
+        raw_ir, raw_red, accel_x, accel_y, accel_z = struct.unpack('<llhhh', data)
+
+        # Convert to float for the buffer
+        corrected_ir = float(raw_ir)
+        corrected_red = float(raw_red)
+
+        data_buffer.append((
+            raw_ir,
+            raw_red,
+            accel_x,
+            accel_y,
+            accel_z,
+            corrected_ir,
+            corrected_red
+        ))
+
+        sample_count += 1
+
+        if sample_count % 100 == 0:
+            print(
+                f"[SENSOR DATA #{sample_count}] "
+                f"IR={raw_ir} | Red={raw_red} | "
+                f"X={accel_x} | Y={accel_y} | Z={accel_z}"
+            )
+
     except Exception as e:
-        print(f"Data parse error: {e}")
+        print(f"[DATA PARSE ERROR] {e}")
 
 async def ble_background_loop():
     """Runs in the background, managing the BLE connection."""
@@ -236,7 +272,7 @@ async def ble_background_loop():
 # --- 4. The Processing & WebSocket Broadcast Task ---
 async def processing_loop():
     """Runs in the background, processing data and sending to Flutter."""
-    global is_monitoring, last_good_bpm, last_good_spo2, last_good_time
+    global is_monitoring, last_good_bpm, last_good_spo2, last_good_time, ble_client
     
     while is_monitoring:
         if len(data_buffer) >= 250:
@@ -245,48 +281,51 @@ async def processing_loop():
 
             # 1. Get BPM and the display wave
             new_bpm, display_wave = process_display_wave(ir_raw, fs=100)
-
-            # 2. Handle BPM Logic with Hold Timer
             now = time.time()
-            if new_bpm > 0:
-                # We have a valid reading! Update the global state.
-                last_good_bpm = new_bpm
-                last_good_time = now
-                
-                if len(display_wave) > 0:
-                    wave_to_send = display_wave.tolist()
-                else:
-                    wave_to_send = (ir_raw - np.mean(ir_raw)).tolist()[-200:]
-                
-                # Calculate SpO2 (only if we have a pulse)
-                last_good_spo2 = compute_spo2(ir_raw, red_raw)
-                quality = "good"
-                
+
+            # 2. ALWAYS update the wave, even if BPM is 0
+            if len(display_wave) > 0:
+                wave_to_send = display_wave.tolist()
             else:
-                # No peaks found. Are we within the hold timeout?
+                # If the filter failed, at least send the centered raw wave
+                wave_to_send = (ir_raw - np.mean(ir_raw)).tolist()[-200:]
+
+            # 3. Handle BPM Logic
+            if new_bpm > 0:
+                last_good_bpm = new_bpm
+                bpm_to_send = new_bpm
+                last_good_time = now
+                last_good_spo2 = compute_spo2(ir_raw, red_raw)
+                spo2_to_send = last_good_spo2
+                quality = "good"
+            else:
                 if (now - last_good_time) < BPM_HOLD_TIMEOUT:
-                    # Hold the last known values
                     bpm_to_send = last_good_bpm
                     spo2_to_send = last_good_spo2
                     quality = "holding" 
-                    # Still send the wave so the graph doesn't freeze
-                    wave_to_send = display_wave.tolist() if len(display_wave) > 0 else []
                 else:
-                    # Timeout expired. The finger is truly off.
+                    # Timeout expired, but we STILL send the wave
                     bpm_to_send = 0
                     spo2_to_send = 0
                     quality = "disconnected"
-                    wave_to_send = []
 
-            # 3. Broadcast to Flutter
+            # 4. Broadcast to Flutter
             payload = {
                 "miner_id": "MINER-01",
                 "ts": now,
                 "quality": quality,
                 "bpm": bpm_to_send,
-                "filtered_data": wave_to_send,
+                "filtered_data": wave_to_send,  # <--- ALWAYS SENT
                 "spo2": spo2_to_send
             }
+
+            if ble_client and ble_client.is_connected and new_bpm > 0:
+                # Format as text: "75,98\n"
+                feedback_str = f"{int(new_bpm)},{int(spo2_to_send)}\n"
+                try:
+                    await ble_client.write_gatt_char(RX_UUID, feedback_str.encode('utf-8'))
+                except Exception as e:
+                    print(f"Feedback error: {e}")
             
             for ws in connected_websockets.copy():
                 try:
