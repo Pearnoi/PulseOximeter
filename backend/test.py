@@ -48,7 +48,7 @@ def process_display_wave(raw_ir, raw_red, fs=100):
     raw_red: numpy array of raw Red samples
     """
     if len(raw_ir) < 150: 
-        return 0, np.array([]), (raw_ir - np.mean(raw_ir)), (raw_red - np.mean(raw_red))
+        return 0, (raw_ir - np.mean(raw_ir)), (raw_red - np.mean(raw_red))
 
     # 1. Remove DC and Filter IR 
     ir_f = lfilter(B_BP, A_BP, raw_ir - np.mean(raw_ir))
@@ -65,17 +65,17 @@ def process_display_wave(raw_ir, raw_red, fs=100):
     )
 
     if len(peaks) < 3:
-        return 0, np.array([]), ir_f, red_f
+        return 0, ir_f, red_f
 
     # 4. Calculate BPM
     intervals = np.diff(peaks)
     bpm = 60.0 * fs / np.median(intervals)
 
     if bpm < 40 or bpm > 200:
-        return 0, np.array([]), ir_f, red_f
+        return 0, ir_f, red_f
 
     # Return BPM, Peaks, Clean IR, Clean Red
-    return bpm, peaks, ir_f, red_f
+    return bpm, ir_f, red_f
 
 def lms_motion_rejection(ppg_ir, ppg_red, accel_signal, filter_length=5):
     """
@@ -241,11 +241,14 @@ async def ble_background_loop():
 async def processing_loop():
     """Runs in the background, processing data and sending to Flutter."""
     global is_monitoring, last_good_bpm, last_good_spo2, last_good_time, ble_client
-    
+
     while is_monitoring:
         if len(data_buffer) >= 50:
             ir_raw = np.array([x[0] for x in data_buffer])
             red_raw = np.array([x[1] for x in data_buffer])
+            now = time.time()
+            new_bpm = 0
+            wave_to_send = []
 
             if signal_quality(ir_raw, np.array([])) == "disconnected":
                 wave_to_send = []
@@ -255,8 +258,7 @@ async def processing_loop():
                 last_good_spo2 = 0
                 last_good_time = 0.0
                 quality = "disconnected"
-            else: 
-                # Extract Accelerometer
+            else:
                 ax = np.array([x[2] for x in data_buffer])
                 ay = np.array([x[3] for x in data_buffer])
                 az = np.array([x[4] for x in data_buffer])
@@ -264,18 +266,13 @@ async def processing_loop():
                 accel_mag = np.sqrt(ax**2 + ay**2 + az**2)
                 ir_clean, red_clean = lms_motion_rejection(ir_raw, red_raw, accel_mag, filter_length=5)
 
-                # 1. Get BPM and the display wave
-                new_bpm, peaks, ir_f, red_f = process_display_wave(ir_clean, red_clean, fs=100)
-                now = time.time()
+                new_bpm, ir_f, red_f = process_display_wave(ir_clean, red_clean, fs=100)
 
-                # 2. ALWAYS update the wave, even if BPM is 0
                 if len(ir_f) > 0:
                     wave_to_send = ir_f.tolist()
                 else:
-                    # If the filter failed, at least send the centered raw wave
                     wave_to_send = (ir_raw - np.mean(ir_raw)).tolist()[-200:]
 
-                # 3. Handle BPM Logic
                 if new_bpm > 0:
                     last_good_bpm = new_bpm
                     bpm_to_send = new_bpm
@@ -284,40 +281,37 @@ async def processing_loop():
                     spo2_to_send = last_good_spo2
                     quality = "good"
                 else:
-                    if (now - last_good_time) < BPM_HOLD_TIMEOUT:
+                    if last_good_time > 0 and (now - last_good_time) < BPM_HOLD_TIMEOUT:
                         bpm_to_send = last_good_bpm
                         spo2_to_send = last_good_spo2
-                        quality = "holding" 
+                        quality = "holding"
                     else:
-                        # Timeout expired, but we STILL send the wave
                         bpm_to_send = 0
                         spo2_to_send = 0
                         quality = "disconnected"
 
-            # 4. Broadcast to Flutter
             payload = {
                 "miner_id": "MINER-01",
                 "ts": now,
                 "quality": quality,
                 "bpm": bpm_to_send,
-                "filtered_data": wave_to_send,  
+                "filtered_data": wave_to_send,
                 "spo2": spo2_to_send
             }
 
             if ble_client and ble_client.is_connected and new_bpm > 0:
-                # Format as text: "75,98\n"
                 feedback_str = f"{int(new_bpm)},{int(spo2_to_send)}\n"
                 try:
                     await ble_client.write_gatt_char(RX_UUID, feedback_str.encode('utf-8'))
                 except Exception as e:
                     print(f"Feedback error: {e}")
-            
+
             for ws in connected_websockets.copy():
                 try:
                     await ws.send_json(payload)
-                except:
-                    connected_websockets.remove(ws)
-                    
+                except Exception:
+                    connected_websockets.discard(ws)
+
         await asyncio.sleep(0.1)
 
 # --- 5. FastAPI Routes ---
