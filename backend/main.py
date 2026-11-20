@@ -17,7 +17,7 @@ app.add_middleware(
     allow_methods=["*"],  # Allows POST, GET, etc.
     allow_headers=["*"],
 )
-## dummy comment
+
 # --- 1. Global State & Configuration ---
 BLE_ADDRESS = "C5:91:ED:08:1D:7D"
 CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
