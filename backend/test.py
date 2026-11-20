@@ -3,7 +3,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from bleak import BleakClient
-from scipy.signal import cheby2, butter, filtfilt, find_peaks, lfilter, sosfiltfilt, savgol_filter
+from scipy.signal import cheby2, butter, filtfilt, find_peaks, lfilter
 from collections import deque
 import uvicorn
 import time
@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. Global State & Configuration ---
+# --- 1. Global State & Configuration (DO NOT TOUCH) ---
 BLE_ADDRESS = "C5:91:ED:08:1D:7D"
 CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e" 
@@ -38,169 +38,137 @@ notification_count = 0
 sample_count = 0
 
 # --- 2. Signal Processing Functions ---
-# Two separate paths so we get BOTH fast numbers and a good-looking waveform:
-#   METRICS path (BPM / SpO2): causal lfilter, uses the newest sample -> "instant" readings
-#   DISPLAY path (waveform):   zero-phase filtfilt + light Savitzky-Golay -> keeps the
-#                              dicrotic notch / true pulse shape, at the cost of a small lag
-B_BP, A_BP = cheby2(N=2, rs=40, Wn=[0.5, 12], btype='bandpass', fs=100)
-
-# Display-path filter: same 4th-order Cheby II 0.5-12 Hz design, but as SOS (numerically
-# safer) and run forward+backward (zero phase). 12 Hz keeps the dicrotic notch intact.
-SOS_DISPLAY = cheby2(N=4, rs=40, Wn=[0.5, 12], btype='bandpass', fs=100, output='sos')
-SG_WINDOW = 7          # 70 ms at 100 Hz (odd number). Bigger = smoother, flatter notch
-SG_POLY = 3            # polynomial order. Higher = keeps more detail
-DISPLAY_LAG = 25       # samples (250 ms): newest samples have filtfilt edge error, so we
-                       # draw the wave this far behind "now". BPM/SpO2 are NOT delayed.
+# 4th Order Butterworth bandpass filter (not too aggressive + filters out baseline distortion well)
+B_BP, A_BP = butter(N=4, Wn=[0.8, 12], btype='bandpass', fs=100)
 DISPLAY_POINTS = 200   # points sent to Flutter (2 s)
 
-def double_moving_average(data, window1=5, window2=5):
-    """Applies a double moving average to smooth the signal."""
-    if len(data) < window1:
-        return data
-    # First pass
-    ma1 = np.convolve(data, np.ones(window1)/window1, mode='same')
-    # Second pass
-    ma2 = np.convolve(ma1, np.ones(window2)/window2, mode='same')
-    return ma2
-
-def butter_bandpass(lowcut, highcut, fs, order=4):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
-
-def apply_bandpass(data, lowcut=0.5, highcut=4.0, fs=100):
-    """Applies a bandpass filter to isolate heart rate frequencies."""
-    if len(data) < 15: # Need enough data for the filter to work
-        return data
-    b, a = butter_bandpass(lowcut, highcut, fs)
-    return filtfilt(b, a, data)
-
-def process_ppg(raw_ir, fs=100):
+def process_display_wave(raw_ir, raw_red, fs=100):
     """
     raw_ir: numpy array of raw IR samples
-    fs: sample rate (100 Hz)
+    raw_red: numpy array of raw Red samples
     """
-    if len(raw_ir) < 200: # Need 2 seconds
-        return 0, np.array([]), (raw_ir - np.mean(raw_ir))
+    if len(raw_ir) < 150: 
+        return 0, np.array([]), (raw_ir - np.mean(raw_ir)), (raw_red - np.mean(raw_red))
 
-    # A. Bandpass Filter (0.5 - 12 Hz)
-    # Use lfilter for real-time streaming (not filtfilt)
-    # Remove the DC level first. Raw IR sits at ~50,000+, so without this the filter
-    # starts from zero, sees a giant step, and rings at the start of every 5 s window.
-    # That ringing was creating a fake peak and making BPM glitch low (~53) every few updates.
-    filtered_bp = lfilter(B_BP, A_BP, raw_ir - np.mean(raw_ir))
-    
-    # B. 50ms Moving Average Filter (5 samples)
-    clean_wave = np.convolve(filtered_bp, np.ones(3)/3, mode='same')
+    # 1. Remove DC and Filter IR 
+    ir_f = lfilter(B_BP, A_BP, raw_ir - np.mean(raw_ir))
 
-    # TODO C. Motion artifact correction with accelerometer 
+    # 2. Remove DC and Filter RED 
+    red_f = lfilter(B_BP, A_BP, raw_red - np.mean(raw_red))
 
-    peaks, properties = find_peaks(
-        clean_wave, 
-        distance=50,       # Minimum 0.5s between beats (120 BPM max)
-        prominence=0.05,    # Very sensitive, let the filter do the work
-        height=0           # Must be a positive peak
-    )
-
-    if len(peaks) < 3:
-        return 0, np.array([]), clean_wave
-
-    # D. Calculate BPM using median interval
-    intervals = np.diff(peaks)
-    bpm = 60.0 * fs / np.median(intervals)
-
-    if bpm < 40 or bpm > 200:
-        return 0, np.array([]), clean_wave
-
-    return bpm, peaks, clean_wave
-
-def process_display_wave(raw_ir, fs=100):
-    """
-    Waveform for the Flutter chart only (BPM/SpO2 do not use this).
-    Returns the last DISPLAY_POINTS samples, ending DISPLAY_LAG samples before "now".
-    """
-    if len(raw_ir) < DISPLAY_POINTS + DISPLAY_LAG + 50:
-        return 0, np.array([])
-
-    # 1. Remove DC so the filter has no start-up transient
-    x = raw_ir - np.mean(raw_ir)
-
-    # 2. Zero-phase bandpass: forward + backward pass cancels phase delay,
-    #    so the notch and upstroke stay at their true positions in time
-    x = sosfiltfilt(SOS_DISPLAY, x)
-
-    # 3. Light Savitzky-Golay smoothing (instead of the 3-point moving average).
-    #    Fits a small polynomial per window, so it cleans noise without flattening peaks.
-    # x = savgol_filter(x, SG_WINDOW, SG_POLY)
-
-    # 4. Drop the unreliable newest edge, then take the display slice
-    end = len(x) - DISPLAY_LAG
-    start = max(0, end - DISPLAY_POINTS)
-    clean_wave = x[start:end]
-
+    # 3. Find peaks on the IR signal
     peaks, _ = find_peaks(
-        clean_wave, 
-        distance=50,       # Minimum 0.5s between beats (120 BPM max)
-        prominence=0.1,    # Very sensitive, let the filter do the work
-        height=0           # Must be a positive peak
+        ir_f, 
+        distance=50,       
+        prominence=0.05,    
+        height=0           
     )
 
     if len(peaks) < 3:
-        return 0, clean_wave
+        return 0, np.array([]), ir_f, red_f
 
-    # D. Calculate BPM using median interval
+    # 4. Calculate BPM
     intervals = np.diff(peaks)
     bpm = 60.0 * fs / np.median(intervals)
 
     if bpm < 40 or bpm > 200:
-        return 0, clean_wave
+        return 0, np.array([]), ir_f, red_f
 
-    return bpm, clean_wave
+    # Return BPM, Peaks, Clean IR, Clean Red
+    return bpm, peaks, ir_f, red_f
 
-def compute_spo2(ir_raw, red_raw):
+def lms_motion_rejection(ppg_ir, ppg_red, accel_signal, filter_length=5):
     """
-    Matches the Arduino logic: DC = avg raw, AC = peak-to-peak of the last 2 seconds of raw
+    Stable LMS Adaptive Filter applied to both IR and Red signals.
     """
-    if len(ir_raw) < 200 or len(red_raw) < 200:
+    n_samples = len(ppg_ir)
+    
+    # 1. Remove DC offset from accelerometer
+    accel_signal = accel_signal - np.mean(accel_signal)
+    
+    # 2. Normalize signals to prevent overflow
+    ir_std = np.std(ppg_ir) + 1e-6
+    red_std = np.std(ppg_red) + 1e-6
+    accel_std = np.std(accel_signal) + 1e-6
+    
+    ir_norm = ppg_ir / ir_std
+    red_norm = ppg_red / red_std
+    accel_norm = accel_signal / accel_std
+    
+    # 3. Calculate a stable mu based on signal power
+    power = np.mean(accel_norm**2) + 1e-6
+    mu = 0.01 / (filter_length * power) 
+    
+    w = np.zeros(filter_length)
+    clean_ir = np.zeros(n_samples)
+    clean_red = np.zeros(n_samples)
+    
+    accel_padded = np.pad(accel_norm, (filter_length, 0), mode='edge')
+    
+    for i in range(n_samples):
+        x = accel_padded[i : i + filter_length]
+        
+        # Estimate noise from accel
+        est_noise = np.dot(w, x)
+        
+        # Subtract from both channels
+        clean_ir[i] = ir_norm[i] - est_noise
+        clean_red[i] = red_norm[i] - est_noise
+        
+        # Guard against NaN/Infinity
+        if np.isnan(clean_ir[i]) or np.isinf(clean_ir[i]):
+            clean_ir[i] = 0
+            clean_red[i] = 0
+            continue
+            
+        # Update weights based on the IR error (the main signal)
+        error = clean_ir[i]
+        w = w + 2 * mu * error * x
+        
+        # Hard clamp on weights to absolutely prevent flipping
+        w = np.clip(w, -2.0, 2.0)
+        
+    # De-normalize back to original scale
+    return clean_ir * ir_std, clean_red * red_std
+
+def compute_spo2(ir_raw, red_raw, ir_f, red_f):
+    """
+    ir_raw, red_raw: Unfiltered signals (for DC)
+    ir_f, red_f: Filtered signals (for AC)
+    """
+    if len(ir_raw) < 200:
         return 0
 
-    # 1. Use the last 2 seconds (200 samples) for calculation
-    # This matches your Arduino SPO2_CALC_PERIOD = 2000
-    ir_window = ir_raw[-200:]
-    red_window = red_raw[-200:]
+    # 1. DC COMPONENTS: Use the RAW signal
+    # We use the mean of the raw signal to capture the static tissue absorption.
+    dc_ir  = np.mean(ir_raw[-200:])
+    dc_red = np.mean(red_raw[-200:])
 
-    # 2. DC components (average of the raw window)
-    dc_ir  = np.mean(ir_window)
-    dc_red = np.mean(red_window)
-
-    # 3. AC components (peak-to-peak of the raw window, exactly like Arduino)
-    ac_ir  = np.max(ir_window) - np.min(ir_window)
-    ac_red = np.max(red_window) - np.min(red_window)
+    # 2. AC COMPONENTS: Use the FILTERED signal
+    # The filtered signal is centered around 0, so max-min gives the true heartbeat amplitude.
+    ac_ir  = np.max(ir_f[-200:]) - np.min(ir_f[-200:])
+    ac_red = np.max(red_f[-200:]) - np.min(red_f[-200:])
 
     # Guard against division by zero
     if dc_ir <= 0 or dc_red <= 0 or ac_ir <= 0:
         return 0
 
-    # Ratio of Ratios
+    # 3. Ratio of Ratios
     R = (ac_red / dc_red) / (ac_ir / dc_ir)
 
-    # Empirical calibration curve
+    # 4. Empirical Calibration
     a, b, c = 1.5958422, -34.6596622, 112.6898759
     spo2 = a * R * R + b * R + c
 
-    # Clamp
-    spo2 = max(70.0, min(100.0, spo2))
-    
-    return spo2
+    # Clamp to realistic values
+    return max(70.0, min(100.0, spo2))
 
 def signal_quality(ir_raw, ir_f):
     """Rough contact/quality check. TUNE thresholds on the real sensor."""
     dc = float(np.mean(ir_raw))
     if dc < 20000:            # finger off / no contact -> IR level collapses
         return "disconnected"
-    if dc > 0 and (np.max(ir_f) - np.min(ir_f)) / dc > 0.05:   # big swings = motion/sweat
+    if dc > 0 and ir_f is not None and len(ir_f) > 0 and (np.max(ir_f) - np.min(ir_f)) / dc > 0.05:
         return "sweat"
     return "good"
 
@@ -275,39 +243,56 @@ async def processing_loop():
     global is_monitoring, last_good_bpm, last_good_spo2, last_good_time, ble_client
     
     while is_monitoring:
-        if len(data_buffer) >= 250:
+        if len(data_buffer) >= 50:
             ir_raw = np.array([x[0] for x in data_buffer])
             red_raw = np.array([x[1] for x in data_buffer])
 
-            # 1. Get BPM and the display wave
-            new_bpm, display_wave = process_display_wave(ir_raw, fs=100)
-            now = time.time()
+            if signal_quality(ir_raw, np.array([])) == "disconnected":
+                wave_to_send = []
+                bpm_to_send = 0
+                spo2_to_send = 0
+                last_good_bpm = 0
+                last_good_spo2 = 0
+                last_good_time = 0.0
+                quality = "disconnected"
+            else: 
+                # Extract Accelerometer
+                ax = np.array([x[2] for x in data_buffer])
+                ay = np.array([x[3] for x in data_buffer])
+                az = np.array([x[4] for x in data_buffer])
 
-            # 2. ALWAYS update the wave, even if BPM is 0
-            if len(display_wave) > 0:
-                wave_to_send = display_wave.tolist()
-            else:
-                # If the filter failed, at least send the centered raw wave
-                wave_to_send = (ir_raw - np.mean(ir_raw)).tolist()[-200:]
+                accel_mag = np.sqrt(ax**2 + ay**2 + az**2)
+                ir_clean, red_clean = lms_motion_rejection(ir_raw, red_raw, accel_mag, filter_length=5)
 
-            # 3. Handle BPM Logic
-            if new_bpm > 0:
-                last_good_bpm = new_bpm
-                bpm_to_send = new_bpm
-                last_good_time = now
-                last_good_spo2 = compute_spo2(ir_raw, red_raw)
-                spo2_to_send = last_good_spo2
-                quality = "good"
-            else:
-                if (now - last_good_time) < BPM_HOLD_TIMEOUT:
-                    bpm_to_send = last_good_bpm
-                    spo2_to_send = last_good_spo2
-                    quality = "holding" 
+                # 1. Get BPM and the display wave
+                new_bpm, peaks, ir_f, red_f = process_display_wave(ir_clean, red_clean, fs=100)
+                now = time.time()
+
+                # 2. ALWAYS update the wave, even if BPM is 0
+                if len(ir_f) > 0:
+                    wave_to_send = ir_f.tolist()
                 else:
-                    # Timeout expired, but we STILL send the wave
-                    bpm_to_send = 0
-                    spo2_to_send = 0
-                    quality = "disconnected"
+                    # If the filter failed, at least send the centered raw wave
+                    wave_to_send = (ir_raw - np.mean(ir_raw)).tolist()[-200:]
+
+                # 3. Handle BPM Logic
+                if new_bpm > 0:
+                    last_good_bpm = new_bpm
+                    bpm_to_send = new_bpm
+                    last_good_time = now
+                    last_good_spo2 = compute_spo2(ir_clean, red_clean, ir_f, red_f)
+                    spo2_to_send = last_good_spo2
+                    quality = "good"
+                else:
+                    if (now - last_good_time) < BPM_HOLD_TIMEOUT:
+                        bpm_to_send = last_good_bpm
+                        spo2_to_send = last_good_spo2
+                        quality = "holding" 
+                    else:
+                        # Timeout expired, but we STILL send the wave
+                        bpm_to_send = 0
+                        spo2_to_send = 0
+                        quality = "disconnected"
 
             # 4. Broadcast to Flutter
             payload = {
@@ -315,7 +300,7 @@ async def processing_loop():
                 "ts": now,
                 "quality": quality,
                 "bpm": bpm_to_send,
-                "filtered_data": wave_to_send,  # <--- ALWAYS SENT
+                "filtered_data": wave_to_send,  
                 "spo2": spo2_to_send
             }
 
